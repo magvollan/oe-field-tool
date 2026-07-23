@@ -318,6 +318,53 @@
   }
 
   .userlist{margin-top:16px; display:flex; flex-direction:column; gap:8px;}
+
+  /* ---------- Messages / chat ---------- */
+  .convo-switcher{display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;}
+  .unread-badge{
+    display:inline-block; min-width:16px; padding:0 5px; margin-left:6px;
+    border-radius:20px; background:var(--accent); color:#fff;
+    font-size:0.68rem; line-height:16px; text-align:center;
+  }
+  .unread-flag{
+    display:inline-block; margin-left:5px; color:var(--accent-glow);
+    font-weight:700;
+  }
+  .seen-line{
+    text-align:right; font-size:0.68rem; color:var(--fog-dim);
+    font-family:'IBM Plex Mono',monospace; margin-top:2px;
+  }
+  .convo-btn{
+    font-family:'IBM Plex Mono',monospace; font-size:0.78rem;
+    padding:6px 12px; border-radius:20px;
+    border:1px solid var(--gray-700); color:var(--fog-dim);
+    background:transparent; cursor:pointer;
+  }
+  .convo-btn.active{border-color:var(--accent); color:var(--accent); background:rgba(217,52,43,0.1);}
+  .chat-thread{
+    display:flex; flex-direction:column; gap:10px;
+    max-height:50vh; min-height:200px; overflow-y:auto;
+    border:1px solid var(--gray-700); border-radius:8px;
+    padding:14px; background:var(--card-bg); margin-bottom:12px;
+  }
+  .msg-row{display:flex; flex-direction:column; max-width:80%;}
+  .msg-row.mine{align-self:flex-end; align-items:flex-end;}
+  .msg-row.theirs{align-self:flex-start; align-items:flex-start;}
+  .msg-bubble{
+    padding:8px 12px; border-radius:10px; font-size:0.85rem; line-height:1.4;
+    border:1px solid var(--gray-700);
+  }
+  .msg-row.mine .msg-bubble{background:rgba(217,52,43,0.12); border-color:rgba(217,52,43,0.35);}
+  .msg-row.theirs .msg-bubble{background:var(--recessed-bg);}
+  .msg-meta{
+    font-family:'IBM Plex Mono',monospace; font-size:0.65rem; color:var(--fog-dim);
+    margin-top:3px; display:flex; gap:8px; align-items:center;
+  }
+  .msg-meta a{color:var(--fog-dim); cursor:pointer;}
+  .msg-meta a:hover{color:var(--accent);}
+  .chat-input-row{display:flex; gap:8px;}
+  .chat-input-row input{flex:1;}
+  .chat-input-row .btn{width:auto;}
   .urow{
     display:flex; align-items:center; justify-content:space-between;
     border:1px solid var(--gray-700); border-radius:6px; padding:10px 12px;
@@ -424,6 +471,87 @@
 
   function usersCol(){ return db.collection(USERS_COLLECTION); }
   function libraryCol(){ return db.collection('library_items'); }
+  function messagesCol(){ return db.collection('messages'); }
+  function dmChannelId(a, b){
+    return 'dm:' + [a, b].sort().join(':');
+  }
+  async function sendMessage(channel, text){
+    await messagesCol().add({
+      channel, text,
+      from: session.u,
+      fromName: (session.fullName && session.fullName.trim()) ? session.fullName.trim() : session.u,
+      timestamp: Date.now()
+    });
+  }
+  async function deleteMessageDoc(id){
+    await messagesCol().doc(id).delete();
+  }
+  function receiptsCol(){ return db.collection('read_receipts'); }
+  function receiptDocId(user, channel){ return user + '__' + channel; }
+  async function setReadReceipt(user, channel, ts){
+    await receiptsCol().doc(receiptDocId(user, channel)).set({user, channel, lastReadTs: ts});
+  }
+
+  // ---------- unread tracking (badges + tab flag) ----------
+  // Runs in the background for the whole session, not just while the Messages tab is open,
+  // so the tab's exclamation flag stays accurate no matter where you're navigating.
+  let myReadReceipts = {};       // channel -> lastReadTs (mine)
+  let allRelevantMessages = [];  // latest snapshot of every message across my channels
+  let unreadCounts = {};         // channel -> unread count
+  let totalUnread = 0;
+  let globalMsgUnsub = null;
+
+  async function getMyChannelIds(){
+    const others = (await loadUsers()).filter(x => x.u !== session.u);
+    return ['team', ...others.map(u => dmChannelId(session.u, u.u))];
+  }
+  function computeUnread(){
+    const counts = {};
+    allRelevantMessages.forEach(m=>{
+      if(m.from === session.u) return; // never count your own messages as unread
+      const lastRead = myReadReceipts[m.channel] || 0;
+      if(m.timestamp > lastRead) counts[m.channel] = (counts[m.channel] || 0) + 1;
+    });
+    unreadCounts = counts;
+    totalUnread = Object.values(counts).reduce((a,b)=>a+b, 0);
+    updateUnreadUI();
+  }
+  function updateUnreadUI(){
+    // Patch whatever's currently on screen directly, without a full re-render
+    // (a global listener can fire while the person is on any tab).
+    const tabBtn = document.querySelector('.tab[data-tab="messages"]');
+    if(tabBtn){
+      tabBtn.innerHTML = 'Messages' + (totalUnread > 0 ? '<span class="unread-flag">!</span>' : '');
+    }
+    document.querySelectorAll('.convo-btn').forEach(btn=>{
+      const count = unreadCounts[btn.dataset.channel] || 0;
+      btn.innerHTML = btn.dataset.label + (count > 0 ? `<span class="unread-badge">${count}</span>` : '');
+    });
+  }
+  async function startMessageWatch(){
+    teardownMessageWatch();
+    const channelIds = await getMyChannelIds();
+    myReadReceipts = {};
+    try{
+      const snap = await receiptsCol().where('user', '==', session.u).get();
+      snap.docs.forEach(d => { const data = d.data(); myReadReceipts[data.channel] = data.lastReadTs; });
+    }catch(e){ console.error('Could not load read receipts.', e); }
+    if(channelIds.length === 0) return;
+    globalMsgUnsub = messagesCol().where('channel', 'in', channelIds.slice(0,30))
+      .onSnapshot(snap => {
+        allRelevantMessages = snap.docs.map(d => ({id: d.id, ...d.data()}));
+        computeUnread();
+      }, err => console.error('Message watch error.', err));
+  }
+  function teardownMessageWatch(){
+    if(globalMsgUnsub){ globalMsgUnsub(); globalMsgUnsub = null; }
+  }
+  async function markChannelRead(channel){
+    const ts = Date.now();
+    myReadReceipts[channel] = ts; // optimistic — zero the badge immediately
+    computeUnread();
+    try{ await setReadReceipt(session.u, channel, ts); }catch(e){ console.error('Could not save read receipt.', e); }
+  }
 
   // ---------- library (folders & files) ----------
   async function getLibraryChildren(parentId){
@@ -684,6 +812,7 @@
       ro.classList.remove('err'); ro.classList.add('ok');
       ro.textContent = 'Access granted.';
       startHeartbeat();
+      startMessageWatch();
       setTimeout(renderDashboard, 350);
     }
   }
@@ -696,9 +825,15 @@
   let heartbeatTimer = null;
   let adminUnsub = null;
   let adminTickTimer = null;
+  let messagesUnsub = null;
+  let seenUnsub = null;
   function teardownAdminListener(){
     if(adminUnsub){ adminUnsub(); adminUnsub = null; }
     if(adminTickTimer){ clearInterval(adminTickTimer); adminTickTimer = null; }
+  }
+  function teardownMessagesListener(){
+    if(messagesUnsub){ messagesUnsub(); messagesUnsub = null; }
+    if(seenUnsub){ seenUnsub(); seenUnsub = null; }
   }
   async function beat(){
     if(!session) return;
@@ -755,13 +890,14 @@
           <button class="tab" data-tab="overview">Overview</button>
           ${readable.includes('reference') ? '<button class="tab" data-tab="reference">Library</button>' : ''}
           ${readable.includes('calculators') ? '<button class="tab" data-tab="calculators">Calculators</button>' : ''}
+          <button class="tab" data-tab="messages">Messages${totalUnread > 0 ? '<span class="unread-flag">!</span>' : ''}</button>
           <button class="tab" data-tab="settings">Settings</button>
         </div>
         <div id="tabContent"></div>
       </div>
     `;
     Array.from(document.querySelectorAll('.tab')).forEach(btn=>{
-      btn.addEventListener('click', ()=>{ teardownAdminListener(); renderDashboard(btn.dataset.tab); });
+      btn.addEventListener('click', ()=>{ teardownAdminListener(); teardownMessagesListener(); renderDashboard(btn.dataset.tab); });
     });
     document.querySelectorAll('.tab').forEach(b=>{
       if(b.dataset.tab === tab) b.classList.add('active');
@@ -777,6 +913,8 @@
           <div class="card"><h3>Calculators</h3><p>Cable sizing, fuse lists and conversions.</p><span class="tag">${tag('calculators')}</span></div>
         </div>
       `;
+    } else if(tab === 'messages'){
+      renderMessages(content);
     } else if(tab === 'reference'){
       renderLibrary(content, writable.includes('reference'));
     } else if(tab === 'calculators'){
@@ -906,6 +1044,137 @@
     await renderFolder();
   }
 
+  // ---------- messages ----------
+  async function renderMessages(content){
+    const allUsers = await loadUsers();
+    const others = allUsers.filter(x => x.u !== session.u);
+    let activeChannel = 'team';
+    let activeLabel = 'Team';
+    let activeOtherUser = null; // set for DMs, null for the team channel
+    let lastRenderedMsgs = [];
+
+    content.innerHTML = `
+      <div class="convo-switcher" id="convoSwitcher"></div>
+      <div class="chat-thread" id="chatThread"></div>
+      <div id="seenLine" class="seen-line"></div>
+      <div class="chat-input-row">
+        <input id="chatInput" placeholder="Message ${activeLabel}…" autocomplete="off">
+        <button class="btn" id="chatSendBtn">Send</button>
+      </div>
+    `;
+
+    const switcherEl = document.getElementById('convoSwitcher');
+    function badgeFor(channel){
+      const count = unreadCounts[channel] || 0;
+      return count > 0 ? `<span class="unread-badge">${count}</span>` : '';
+    }
+    switcherEl.innerHTML = `
+      <button class="convo-btn active" data-channel="team" data-label="Team" data-other="">Team${badgeFor('team')}</button>
+      ${others.map(u => {
+        const ch = dmChannelId(session.u, u.u);
+        return `<button class="convo-btn" data-channel="${ch}" data-label="${(u.fullName || u.u)}" data-other="${u.u}">${(u.fullName || u.u)}${badgeFor(ch)}</button>`;
+      }).join('')}
+    `;
+
+    function switchConvo(channel, label, otherUser){
+      activeChannel = channel;
+      activeLabel = label;
+      activeOtherUser = otherUser || null;
+      document.getElementById('chatInput').placeholder = `Message ${label}…`;
+      document.getElementById('seenLine').textContent = '';
+      switcherEl.querySelectorAll('.convo-btn').forEach(b=>{
+        b.classList.toggle('active', b.dataset.channel === channel);
+      });
+      subscribeToChannel(channel);
+    }
+    switcherEl.querySelectorAll('.convo-btn').forEach(btn=>{
+      btn.addEventListener('click', ()=> switchConvo(btn.dataset.channel, btn.dataset.label, btn.dataset.other || null));
+    });
+
+    function subscribeToChannel(channel){
+      teardownMessagesListener();
+      const threadEl = document.getElementById('chatThread');
+      threadEl.innerHTML = '<div style="color:var(--fog-dim); font-size:0.82rem;">Loading…</div>';
+      messagesUnsub = messagesCol().where('channel', '==', channel).orderBy('timestamp', 'asc')
+        .onSnapshot(snap => {
+          const msgs = snap.docs.map(d => ({id: d.id, ...d.data()}));
+          renderThread(msgs);
+          markChannelRead(channel); // viewing it counts as read, including new messages that arrive while open
+        }, err => {
+          console.error('Message listener error.', err);
+          threadEl.innerHTML = '<div style="color:var(--err-text); font-size:0.82rem;">Could not load messages.</div>';
+        });
+
+      if(activeOtherUser){
+        seenUnsub = receiptsCol().doc(receiptDocId(activeOtherUser, channel)).onSnapshot(doc=>{
+          const theirLastRead = doc.exists ? doc.data().lastReadTs : 0;
+          updateSeenLine(theirLastRead);
+        }, err => console.error('Seen listener error.', err));
+      }
+    }
+
+    function updateSeenLine(theirLastRead){
+      const seenEl = document.getElementById('seenLine');
+      if(!activeOtherUser){ seenEl.textContent = ''; return; }
+      const myLastMsg = [...lastRenderedMsgs].reverse().find(m => m.from === session.u);
+      if(myLastMsg && theirLastRead && theirLastRead >= myLastMsg.timestamp){
+        seenEl.textContent = `Seen ${timeAgo(theirLastRead)}`;
+      }else{
+        seenEl.textContent = '';
+      }
+    }
+
+    function renderThread(msgs){
+      lastRenderedMsgs = msgs;
+      const threadEl = document.getElementById('chatThread');
+      const wasAtBottom = (threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight) < 60;
+      threadEl.innerHTML = msgs.length ? msgs.map(m => {
+        const mine = m.from === session.u;
+        const canDelete = mine || session.status === 'admin';
+        return `
+          <div class="msg-row ${mine ? 'mine' : 'theirs'}">
+            <div class="msg-bubble">${escapeHtml(m.text)}</div>
+            <div class="msg-meta">
+              <span>${escapeHtml(m.fromName || m.from)} · ${timeAgo(m.timestamp)}</span>
+              ${canDelete ? `<a href="#" data-delmsg="${m.id}">remove</a>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('') : '<div style="color:var(--fog-dim); font-size:0.82rem;">No messages yet — say hello.</div>';
+
+      threadEl.querySelectorAll('[data-delmsg]').forEach(a=>{
+        a.addEventListener('click', async (e)=>{
+          e.preventDefault();
+          await deleteMessageDoc(a.dataset.delmsg);
+        });
+      });
+
+      if(wasAtBottom || msgs.length <= 1){
+        threadEl.scrollTop = threadEl.scrollHeight;
+      }
+    }
+
+    function escapeHtml(str){
+      const d = document.createElement('div');
+      d.textContent = str || '';
+      return d.innerHTML;
+    }
+
+    async function doSend(){
+      const input = document.getElementById('chatInput');
+      const text = input.value.trim();
+      if(!text) return;
+      input.value = '';
+      await sendMessage(activeChannel, text);
+    }
+    document.getElementById('chatSendBtn').addEventListener('click', doSend);
+    document.getElementById('chatInput').addEventListener('keydown', (e)=>{
+      if(e.key === 'Enter') doSend();
+    });
+
+    subscribeToChannel(activeChannel);
+  }
+
   async function renderSettings(content){
     const me = await getUser(session.u);
     const currentTheme = getThemePref();
@@ -1001,6 +1270,8 @@
 
     document.getElementById('logoutBtn').addEventListener('click', async ()=>{
       teardownAdminListener();
+      teardownMessagesListener();
+      teardownMessageWatch();
       stopHeartbeat();
       try{ await usersCol().doc(session.u).set({online: false}, {merge:true}); }catch(err){}
       try{ localStorage.removeItem(SESSION_KEY); }catch(err){}
@@ -1322,6 +1593,8 @@
   async function boot(){
     session = null;
     teardownAdminListener();
+    teardownMessagesListener();
+    teardownMessageWatch();
     stopHeartbeat();
     root.className = 'app';
     root.innerHTML = `<div class="panel">${rivets()}<div class="plate"><div class="brand">OE <span>FIELD</span> TOOL</div><div class="sub">Connecting…</div></div></div>`;
@@ -1350,6 +1623,7 @@
       if(rec){
         session = {u: rec.u, status: rec.status, fullName: rec.fullName || '', primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
         startHeartbeat();
+        startMessageWatch();
         renderDashboard();
         return;
       }else{
