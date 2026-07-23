@@ -309,7 +309,11 @@
   const root = document.getElementById('root');
   let session = null; // {u, status} — memory only, not persisted (by design)
 
-  const JOB_ROLES = ['Technician','Radio Surveyor','Engineer','Coordinator','HR','Other'];
+  const DEFAULT_ROLES = ['Technician','Radio Surveyor','Engineer','Coordinator','HR'];
+  const SECTIONS = [
+    {key:'reference', label:'Reference Library'},
+    {key:'calculators', label:'Calculators'}
+  ];
   const DEFAULT_ADMIN_USER = 'admin';
   const DEFAULT_ADMIN_PASS = 'OEAdmin';
   const SESSION_KEY = 'oe_session_user';
@@ -333,10 +337,18 @@
   // ---------- storage helpers ----------
   // Backed by Firestore. Anonymous auth (silent, no UI) satisfies the security
   // rules that gate this collection — it is not the app's own login screen.
+  // Migrates old single-jobRole records to primaryRole/secondaryRoles shape on read,
+  // so nothing breaks for accounts created before multi-role support existed.
+  function normalizeUser(rec){
+    if(!rec) return rec;
+    if(!rec.primaryRole) rec.primaryRole = rec.jobRole || '';
+    if(!Array.isArray(rec.secondaryRoles)) rec.secondaryRoles = [];
+    return rec;
+  }
   async function loadUsers(){
     try{
       const snap = await usersCol().get();
-      return snap.docs.map(d => d.data());
+      return snap.docs.map(d => normalizeUser(d.data()));
     }catch(e){
       console.error('Could not load accounts from Firestore.', e);
       return [];
@@ -345,7 +357,7 @@
   async function getUser(u){
     try{
       const doc = await usersCol().doc(u).get();
-      return doc.exists ? doc.data() : null;
+      return doc.exists ? normalizeUser(doc.data()) : null;
     }catch(e){
       console.error('Could not load account from Firestore.', e);
       return null;
@@ -381,8 +393,59 @@
     if(all.length === 0 && !existing){
       const salt = randSaltHex();
       const hash = await hashPassword(DEFAULT_ADMIN_PASS, salt);
-      await saveUser({u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', jobRole:'Coordinator', created: Date.now()});
+      await saveUser({u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', primaryRole:'Coordinator', secondaryRoles:[], created: Date.now()});
     }
+  }
+
+  // ---------- roles & permissions ----------
+  const metaDoc = (name) => db.collection('meta').doc(name);
+  async function loadRoles(){
+    try{
+      const doc = await metaDoc('roles').get();
+      return doc.exists ? (doc.data().list || []) : [];
+    }catch(e){ console.error('Could not load roles.', e); return []; }
+  }
+  async function saveRoles(list){
+    await metaDoc('roles').set({list});
+  }
+  async function loadPermissions(){
+    try{
+      const doc = await metaDoc('permissions').get();
+      return doc.exists ? doc.data() : {};
+    }catch(e){ console.error('Could not load permissions.', e); return {}; }
+  }
+  async function saveRolePermissions(role, perms){
+    await metaDoc('permissions').set({[role]: perms}, {merge:true});
+  }
+  function emptyPerms(){
+    const p = {};
+    SECTIONS.forEach(s => p[s.key] = {read:false});
+    return p;
+  }
+  async function ensureSeedRolesPermissions(){
+    const rolesDoc = await metaDoc('roles').get();
+    if(!rolesDoc.exists){
+      await saveRoles(DEFAULT_ROLES);
+      const seedPerms = {};
+      DEFAULT_ROLES.forEach(r => {
+        seedPerms[r] = {};
+        SECTIONS.forEach(s => seedPerms[r][s.key] = {read:true});
+      });
+      await metaDoc('permissions').set(seedPerms);
+    }
+  }
+  // What can this session read? Admin status always sees everything.
+  // Non-admins get the union of permissions across their primary role + all secondary roles.
+  async function getMyReadableSections(){
+    if(session && session.status === 'admin') return SECTIONS.map(s=>s.key);
+    const perms = await loadPermissions();
+    const myRoles = session ? [session.primaryRole, ...(session.secondaryRoles||[])].filter(Boolean) : [];
+    const readable = new Set();
+    myRoles.forEach(r => {
+      const rp = perms[r];
+      if(rp) SECTIONS.forEach(s => { if(rp[s.key] && rp[s.key].read) readable.add(s.key); });
+    });
+    return SECTIONS.filter(s => readable.has(s.key)).map(s=>s.key);
   }
 
   // ---------- rivets ----------
@@ -390,8 +453,8 @@
     return '<span class="rivet tl"></span><span class="rivet tr"></span><span class="rivet bl"></span><span class="rivet br"></span>';
   }
 
-  function jobRoleOptions(selected){
-    return JOB_ROLES.map(r => `<option value="${r}" ${r===selected?'selected':''}>${r}</option>`).join('');
+  function jobRoleOptions(selected, roles){
+    return roles.map(r => `<option value="${r}" ${r===selected?'selected':''}>${r}</option>`).join('');
   }
 
   // ---------- render: power-up gate wrapping login ----------
@@ -450,7 +513,7 @@
       if(!rec){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — unknown username.'; return; }
       const hash = await hashPassword(p, rec.salt);
       if(hash !== rec.hash){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — incorrect password.'; return; }
-      session = {u: rec.u, status: rec.status};
+      session = {u: rec.u, status: rec.status, primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
       try{ localStorage.setItem(SESSION_KEY, rec.u); }catch(e){}
       ro.classList.remove('err'); ro.classList.add('ok');
       ro.textContent = 'Access granted.';
@@ -501,8 +564,12 @@
   }
 
   // ---------- dashboard ----------
-  function renderDashboard(tab){
+  async function renderDashboard(tab){
     tab = tab || 'overview';
+    const readable = await getMyReadableSections(); // e.g. ['reference'] — sections this session can see
+    if(tab !== 'overview' && tab !== 'admin' && !readable.includes(tab)){
+      tab = 'overview'; // don't render a section they've lost/never had access to
+    }
     root.className = 'app wide';
     root.innerHTML = `
       <div class="panel">
@@ -515,8 +582,8 @@
         </div>
         <div class="tabs" id="tabs">
           <button class="tab" data-tab="overview">Overview</button>
-          <button class="tab" data-tab="reference">Reference</button>
-          <button class="tab" data-tab="calculators">Calculators</button>
+          ${readable.includes('reference') ? '<button class="tab" data-tab="reference">Reference</button>' : ''}
+          ${readable.includes('calculators') ? '<button class="tab" data-tab="calculators">Calculators</button>' : ''}
           ${session.status==='admin' ? '<button class="tab" data-tab="admin">Admin</button>' : ''}
         </div>
         <div id="tabContent"></div>
@@ -540,11 +607,12 @@
 
     const content = document.getElementById('tabContent');
     if(tab === 'overview'){
+      const tag = (key) => session.status==='admin' ? 'Available' : (readable.includes(key) ? 'Available' : 'No access');
       content.innerHTML = `
         <div class="cards">
           <div class="card"><h3>Checklists &amp; Jobs</h3><p>Job checklists, notes and photos per vessel.</p><span class="tag">Not installed yet</span></div>
-          <div class="card"><h3>Reference Library</h3><p>SFI codes and equipment specs.</p><span class="tag">Not installed yet</span></div>
-          <div class="card"><h3>Calculators</h3><p>Cable sizing, fuse lists and conversions.</p><span class="tag">Not installed yet</span></div>
+          <div class="card"><h3>Reference Library</h3><p>SFI codes and equipment specs.</p><span class="tag">${tag('reference')}</span></div>
+          <div class="card"><h3>Calculators</h3><p>Cable sizing, fuse lists and conversions.</p><span class="tag">${tag('calculators')}</span></div>
           <div class="card"><h3>Admin</h3><p>Manage who can log in to this panel.</p><span class="tag">${session.status==='admin' ? 'Available' : 'Admin only'}</span></div>
         </div>
       `;
@@ -557,6 +625,9 @@
 
   async function renderAdmin(content){
     const users = await loadUsers();
+    let roles = await loadRoles();
+    let permissions = await loadPermissions();
+
     content.innerHTML = `
       <div class="section-title" style="margin-top:0;border-top:none;padding-top:0;">Create new account</div>
       <div class="field"><label>Username</label><input id="nu"></div>
@@ -564,18 +635,43 @@
       <div class="field"><label>Account status</label>
         <select id="nstatus"><option value="user">User</option><option value="admin">Admin</option></select>
       </div>
-      <div class="field"><label>Role</label>
-        <select id="nrole">${jobRoleOptions('Technician')}</select>
+      <div class="field"><label>Primary role (main job description)</label>
+        <select id="nrole">${jobRoleOptions(roles[0], roles)}</select>
       </div>
-      <div class="field" id="nroleOtherWrap" style="display:none;"><label>Specify role</label><input id="nroleOther"></div>
+      <div class="field"><label>Additional roles</label>
+        <div id="nSecondaryRoles" style="display:flex; flex-wrap:wrap; gap:12px;"></div>
+      </div>
       <button class="btn" id="addUserBtn">Create account</button>
       <div class="readout" id="adminReadout"></div>
       <div class="section-title">Existing accounts</div>
       <div class="userlist" id="userlist"></div>
+
+      <div class="section-title">Roles &amp; permissions</div>
+      <p style="color:var(--fog-dim); font-size:0.8rem; margin:0 0 12px;">Controls which sections each role can see. Account status (User/Admin) is separate — Admins always see everything.</p>
+      <div class="field"><label>Add new role</label>
+        <div style="display:flex; gap:8px;">
+          <input id="newRoleName" style="flex:1;">
+          <button class="btn small" style="width:auto;" id="addRoleBtn">Add role</button>
+        </div>
+      </div>
+      <div class="readout" id="roleReadout"></div>
+      <div id="permGrid"></div>
     `;
 
+    function renderSecondaryCheckboxes(container, allRoles, primary, checkedList){
+      container.innerHTML = allRoles.filter(r => r !== primary).map(r => `
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.82rem;">
+          <input type="checkbox" value="${r}" ${checkedList.includes(r) ? 'checked' : ''}> ${r}
+        </label>
+      `).join('') || '<span style="color:var(--fog-dim); font-size:0.8rem;">No other roles yet.</span>';
+    }
+
+    const nSecondaryEl = document.getElementById('nSecondaryRoles');
+    renderSecondaryCheckboxes(nSecondaryEl, roles, document.getElementById('nrole').value, []);
     document.getElementById('nrole').addEventListener('change', (e)=>{
-      document.getElementById('nroleOtherWrap').style.display = e.target.value === 'Other' ? 'block' : 'none';
+      // preserve current checks that are still valid under the new primary
+      const stillChecked = Array.from(nSecondaryEl.querySelectorAll('input:checked')).map(cb=>cb.value);
+      renderSecondaryCheckboxes(nSecondaryEl, roles, e.target.value, stillChecked);
     });
 
     function flash(msg, ok){
@@ -583,6 +679,58 @@
       ro.className = 'readout show ' + (ok ? 'ok' : 'err');
       ro.textContent = msg;
     }
+    function flashRole(msg, ok){
+      const ro = document.getElementById('roleReadout');
+      ro.className = 'readout show ' + (ok ? 'ok' : 'err');
+      ro.textContent = msg;
+    }
+
+    function renderPermGrid(){
+      const grid = document.getElementById('permGrid');
+      grid.innerHTML = roles.map(role => {
+        const rolePerms = permissions[role] || emptyPerms();
+        const checks = SECTIONS.map(s => `
+          <label style="display:flex; align-items:center; gap:6px; font-size:0.78rem; color:var(--fog-dim); font-family:'IBM Plex Mono',monospace;">
+            <input type="checkbox" class="perm-check" data-role="${role}" data-section="${s.key}" ${rolePerms[s.key] && rolePerms[s.key].read ? 'checked' : ''}>
+            ${s.label} — Read
+          </label>
+        `).join('');
+        return `
+          <div class="urow" style="flex-direction:column; align-items:stretch; gap:8px;">
+            <div class="name">${role}</div>
+            <div style="display:flex; flex-wrap:wrap; gap:14px;">${checks}</div>
+          </div>
+        `;
+      }).join('');
+
+      grid.querySelectorAll('.perm-check').forEach(cb => {
+        cb.addEventListener('change', async (e)=>{
+          const role = e.target.dataset.role;
+          const sectionKey = e.target.dataset.section;
+          const current = permissions[role] || emptyPerms();
+          current[sectionKey] = {read: e.target.checked};
+          permissions[role] = current;
+          await saveRolePermissions(role, current);
+          flashRole(`Updated permissions for "${role}".`, true);
+        });
+      });
+    }
+    renderPermGrid();
+
+    document.getElementById('addRoleBtn').addEventListener('click', async ()=>{
+      const name = document.getElementById('newRoleName').value.trim();
+      if(!name){ flashRole('Enter a role name.'); return; }
+      if(roles.includes(name)){ flashRole('That role already exists.'); return; }
+      roles = [...roles, name];
+      await saveRoles(roles);
+      permissions[name] = emptyPerms(); // no access until explicitly granted
+      await saveRolePermissions(name, permissions[name]);
+      flashRole(`Role "${name}" added — no access granted yet.`, true);
+      document.getElementById('newRoleName').value = '';
+      document.getElementById('nrole').innerHTML = jobRoleOptions(roles[0], roles);
+      renderSecondaryCheckboxes(nSecondaryEl, roles, document.getElementById('nrole').value, []);
+      renderPermGrid();
+    });
 
     function renderList(list){
       const ul = document.getElementById('userlist');
@@ -595,7 +743,7 @@
           <div style="display:flex; align-items:center; justify-content:space-between;">
             <div>
               <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};margin-right:7px;"></span>
-              <span class="name">${x.u}</span><span class="role">${x.status} · ${x.jobRole || '—'} · ${statusText}</span>
+              <span class="name">${x.u}</span><span class="role">${x.status} · ${x.primaryRole || '—'}${x.secondaryRoles && x.secondaryRoles.length ? ' + ' + x.secondaryRoles.join(', ') : ''} · ${statusText}</span>
             </div>
             <div style="display:flex; gap:6px;">
               <button class="btn ghost small" data-edit="${x.u}">Edit</button>
@@ -635,17 +783,20 @@
                 <option value="admin" ${rec.status==='admin'?'selected':''}>Admin</option>
               </select>
             </div>
-            <div class="field"><label>Role</label>
-              <select class="e-role">${jobRoleOptions(JOB_ROLES.includes(rec.jobRole) ? rec.jobRole : 'Other')}</select>
+            <div class="field"><label>Primary role (main job description)</label>
+              <select class="e-role">${jobRoleOptions(rec.primaryRole, roles)}</select>
             </div>
-            <div class="field e-role-other-wrap" style="${JOB_ROLES.includes(rec.jobRole) ? 'display:none;' : ''}">
-              <label>Specify role</label><input class="e-role-other" value="${JOB_ROLES.includes(rec.jobRole) ? '' : (rec.jobRole||'')}">
+            <div class="field"><label>Additional roles</label>
+              <div class="e-secondary" style="display:flex; flex-wrap:wrap; gap:12px;"></div>
             </div>
             <div class="field"><label>Reset password (leave blank to keep current)</label><input class="e-pass" type="password"></div>
             <button class="btn small" style="width:auto;" data-save="${target}">Save changes</button>
           `;
+          const eSecondaryEl = area.querySelector('.e-secondary');
+          renderSecondaryCheckboxes(eSecondaryEl, roles, rec.primaryRole, rec.secondaryRoles || []);
           area.querySelector('.e-role').addEventListener('change', (e)=>{
-            area.querySelector('.e-role-other-wrap').style.display = e.target.value === 'Other' ? 'block' : 'none';
+            const stillChecked = Array.from(eSecondaryEl.querySelectorAll('input:checked')).map(cb=>cb.value);
+            renderSecondaryCheckboxes(eSecondaryEl, roles, e.target.value, stillChecked);
           });
           area.querySelector('[data-save]').addEventListener('click', async ()=>{
             let list2 = await loadUsers();
@@ -656,12 +807,11 @@
             if(admins.length===1 && admins[0].u===target && newStatus!=='admin'){
               flash('Cannot demote the last remaining admin.'); return;
             }
-            let newRole = area.querySelector('.e-role').value;
-            if(newRole === 'Other'){
-              newRole = area.querySelector('.e-role-other').value.trim() || 'Other';
-            }
+            const newPrimaryRole = area.querySelector('.e-role').value;
+            const newSecondaryRoles = Array.from(eSecondaryEl.querySelectorAll('input:checked')).map(cb=>cb.value);
             const newPass = area.querySelector('.e-pass').value;
-            const updated = { ...list2[idx], status: newStatus, jobRole: newRole };
+            const updated = { ...list2[idx], status: newStatus, primaryRole: newPrimaryRole, secondaryRoles: newSecondaryRoles };
+            delete updated.jobRole; // fully migrated off the old single-role field
             if(newPass){
               if(newPass.length < 6){ flash('New password should be at least 6 characters.'); return; }
               const salt = randSaltHex();
@@ -689,20 +839,17 @@
       const u = document.getElementById('nu').value.trim().toLowerCase();
       const p = document.getElementById('np').value;
       const status = document.getElementById('nstatus').value;
-      let jobRole = document.getElementById('nrole').value;
-      if(jobRole === 'Other'){
-        jobRole = document.getElementById('nroleOther').value.trim() || 'Other';
-      }
+      const primaryRole = document.getElementById('nrole').value;
+      const secondaryRoles = Array.from(nSecondaryEl.querySelectorAll('input:checked')).map(cb=>cb.value);
       if(!u || !p){ flash('Username and password are required.'); return; }
       if(p.length < 6){ flash('Password should be at least 6 characters.'); return; }
       const exists = await getUser(u);
       if(exists){ flash('That username already exists.'); return; }
       const salt = randSaltHex();
       const hash = await hashPassword(p, salt);
-      await saveUser({u, salt, hash, status, jobRole, created: Date.now()});
+      await saveUser({u, salt, hash, status, primaryRole, secondaryRoles, created: Date.now()});
       flash(`Account "${u}" created.`, true);
       document.getElementById('nu').value=''; document.getElementById('np').value='';
-      document.getElementById('nroleOther').value='';
       renderList(await loadUsers());
     });
   }
@@ -724,13 +871,14 @@
       return;
     }
     await ensureSeedAdmin();
+    await ensureSeedRolesPermissions();
 
     let savedUser = null;
     try{ savedUser = localStorage.getItem(SESSION_KEY); }catch(e){}
     if(savedUser){
       const rec = await getUser(savedUser);
       if(rec){
-        session = {u: rec.u, status: rec.status};
+        session = {u: rec.u, status: rec.status, primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
         startHeartbeat();
         renderDashboard();
         return;
