@@ -427,7 +427,7 @@
     if(all.length === 0 && !existing){
       const salt = randSaltHex();
       const hash = await hashPassword(DEFAULT_ADMIN_PASS, salt);
-      await saveUser({u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', primaryRole:'Coordinator', secondaryRoles:[], created: Date.now()});
+      await saveUser({u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', fullName:'', primaryRole:'Coordinator', secondaryRoles:[], created: Date.now()});
     }
   }
 
@@ -572,7 +572,7 @@
       if(!rec){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — unknown username.'; return; }
       const hash = await hashPassword(p, rec.salt);
       if(hash !== rec.hash){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — incorrect password.'; return; }
-      session = {u: rec.u, status: rec.status, primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
+      session = {u: rec.u, status: rec.status, fullName: rec.fullName || '', primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
       try{ localStorage.setItem(SESSION_KEY, rec.u); }catch(e){}
       ro.classList.remove('err'); ro.classList.add('ok');
       ro.textContent = 'Access granted.';
@@ -611,6 +611,10 @@
     if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
     document.removeEventListener('visibilitychange', handleVisibility);
   }
+  function firstNameOf(rec){
+    const fn = (rec && rec.fullName || '').trim();
+    return fn ? fn.split(' ')[0] : (rec ? rec.u : '');
+  }
   function timeAgo(ts){
     if(!ts) return 'never';
     const s = Math.floor((Date.now() - ts) / 1000);
@@ -637,7 +641,7 @@
           <div class="plate" style="border:none;margin:0;padding:0;text-align:left;">
             <div class="brand" style="font-size:1.15rem;">OE <span>FIELD</span> TOOL</div>
           </div>
-          <div class="who">Logged in as <b>${session.u}</b> (${session.status})</div>
+          <div class="who"><b>${(session.fullName && session.fullName.trim()) ? session.fullName.trim().split(/\s+/)[0] : session.u}</b></div>
         </div>
         <div class="tabs" id="tabs">
           <button class="tab" data-tab="overview">Overview</button>
@@ -682,6 +686,9 @@
           ${me.status === 'admin' ? 'Admin' : 'User'} · ${me.primaryRole || '—'}${me.secondaryRoles && me.secondaryRoles.length ? ' + ' + me.secondaryRoles.join(', ') : ''}
         </p>
       </div>
+      <div class="field"><label>Full name</label><input id="fullNameInput" value="${me.fullName || ''}"></div>
+      <button class="btn" id="saveNameBtn" style="width:auto;">Save name</button>
+      <div class="readout" id="nameReadout"></div>
 
       <div class="section-title">Change password</div>
       <div class="field"><label>Current password</label><input id="curPass" type="password"></div>
@@ -711,6 +718,18 @@
       <div class="section-title"></div>
       <button class="btn ghost" id="logoutBtn">Log out</button>
     `;
+
+    document.getElementById('saveNameBtn').addEventListener('click', async ()=>{
+      const ro = document.getElementById('nameReadout');
+      ro.className = 'readout show';
+      const newName = document.getElementById('fullNameInput').value.trim(); // case preserved exactly as typed
+      const rec = await getUser(session.u);
+      await saveUser({...rec, fullName: newName});
+      session.fullName = newName;
+      ro.classList.add('ok');
+      ro.textContent = 'Name updated.';
+      setTimeout(()=> renderDashboard('settings'), 600); // refresh so the top bar reflects the new name
+    });
 
     document.getElementById('changePassBtn').addEventListener('click', async ()=>{
       const cur = document.getElementById('curPass').value;
@@ -766,7 +785,7 @@
         <div class="urow">
           <div>
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};margin-right:7px;"></span>
-            <span class="name">${x.u}</span><span class="role">${x.primaryRole || '—'} · ${statusText}</span>
+            <span class="name">${x.u}${x.fullName ? ' (' + x.fullName + ')' : ''}</span><span class="role">${x.primaryRole || '—'} · ${statusText}</span>
           </div>
         </div>
       `;}).join('') : '<div style="color:var(--fog-dim); font-size:0.82rem;">No accounts yet.</div>';
@@ -785,6 +804,7 @@
     document.getElementById('openAddUserBtn').addEventListener('click', ()=>{
       const body = openModal('Add account', `
         <div class="field"><label>Username</label><input id="nu"></div>
+        <div class="field"><label>Full name</label><input id="nFullName"></div>
         <div class="field"><label>Temporary password</label><input id="np" type="password"></div>
         <div class="field"><label>Account status</label>
           <select id="nstatus"><option value="user">User</option><option value="admin">Admin</option></select>
@@ -811,6 +831,7 @@
       }
       body.querySelector('#addUserBtn').addEventListener('click', async ()=>{
         const u = body.querySelector('#nu').value.trim().toLowerCase();
+        const fullName = body.querySelector('#nFullName').value.trim(); // case preserved exactly as typed
         const p = body.querySelector('#np').value;
         const status = body.querySelector('#nstatus').value;
         const primaryRole = body.querySelector('#nrole').value;
@@ -821,7 +842,7 @@
         if(exists){ flash('That username already exists.'); return; }
         const salt = randSaltHex();
         const hash = await hashPassword(p, salt);
-        await saveUser({u, salt, hash, status, primaryRole, secondaryRoles, created: Date.now()});
+        await saveUser({u, fullName, salt, hash, status, primaryRole, secondaryRoles, created: Date.now()});
         flash(`Account "${u}" created.`, true);
         setTimeout(closeModal, 700);
       });
@@ -835,7 +856,7 @@
           ${list.map(x => `
             <div class="urow">
               <div>
-                <span class="name">${x.u}</span><span class="role">${x.status} · ${x.primaryRole || '—'}${x.secondaryRoles && x.secondaryRoles.length ? ' + ' + x.secondaryRoles.join(', ') : ''}</span>
+                <span class="name">${x.u}${x.fullName ? ' (' + x.fullName + ')' : ''}</span><span class="role">${x.status} · ${x.primaryRole || '—'}${x.secondaryRoles && x.secondaryRoles.length ? ' + ' + x.secondaryRoles.join(', ') : ''}</span>
               </div>
               <div style="display:flex; gap:6px;">
                 <button class="btn ghost small" data-edit="${x.u}">Edit</button>
@@ -874,6 +895,7 @@
       body.innerHTML = `
         <a href="#" id="backToAccounts" style="color:var(--fog-dim); font-size:0.8rem; display:inline-block; margin-bottom:14px;">&larr; Back to list</a>
         <div class="section-title" style="margin-top:0;border-top:none;padding-top:0;">Edit: ${rec.u}</div>
+        <div class="field"><label>Full name</label><input id="eFullName" value="${rec.fullName || ''}"></div>
         <div class="field"><label>Account status</label>
           <select id="eStatus">
             <option value="user" ${rec.status==='user'?'selected':''}>User</option>
@@ -908,6 +930,7 @@
       document.getElementById('saveEditBtn').addEventListener('click', async ()=>{
         const list2 = await loadUsers();
         const target = rec.u;
+        const newFullName = document.getElementById('eFullName').value.trim(); // case preserved exactly as typed
         const newStatus = document.getElementById('eStatus').value;
         const admins = list2.filter(x=>x.status==='admin');
         if(admins.length===1 && admins[0].u===target && newStatus!=='admin'){
@@ -917,7 +940,7 @@
         const newSecondaryRoles = Array.from(eSecondaryEl.querySelectorAll('input:checked')).map(cb=>cb.value);
         const newPass = document.getElementById('ePass').value;
         const current = list2.find(x=>x.u===target);
-        const updated = { ...current, status: newStatus, primaryRole: newPrimaryRole, secondaryRoles: newSecondaryRoles };
+        const updated = { ...current, fullName: newFullName, status: newStatus, primaryRole: newPrimaryRole, secondaryRoles: newSecondaryRoles };
         delete updated.jobRole;
         if(newPass){
           if(newPass.length < 6){ flash('New password should be at least 6 characters.'); return; }
@@ -1056,7 +1079,7 @@
     if(savedUser){
       const rec = await getUser(savedUser);
       if(rec){
-        session = {u: rec.u, status: rec.status, primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
+        session = {u: rec.u, status: rec.status, fullName: rec.fullName || '', primaryRole: rec.primaryRole, secondaryRoles: rec.secondaryRoles || []};
         startHeartbeat();
         renderDashboard();
         return;
