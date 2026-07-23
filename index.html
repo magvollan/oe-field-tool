@@ -473,7 +473,7 @@
   }
   async function beat(){
     if(!session) return;
-    try{ await usersCol().doc(session.u).set({lastSeen: Date.now()}, {merge:true}); }
+    try{ await usersCol().doc(session.u).set({lastSeen: Date.now(), online: true}, {merge:true}); }
     catch(e){ console.error('Heartbeat failed.', e); }
   }
   function handleVisibility(){
@@ -526,7 +526,7 @@
       e.preventDefault();
       teardownAdminListener();
       stopHeartbeat();
-      try{ await usersCol().doc(session.u).set({lastSeen: 0}, {merge:true}); }catch(err){}
+      try{ await usersCol().doc(session.u).set({online: false}, {merge:true}); }catch(err){}
       try{ localStorage.removeItem(SESSION_KEY); }catch(err){}
       session = null;
       boot();
@@ -587,7 +587,7 @@
     function renderList(list){
       const ul = document.getElementById('userlist');
       ul.innerHTML = list.map(x => {
-        const online = x.lastSeen && (Date.now() - x.lastSeen) < ONLINE_THRESHOLD_MS;
+        const online = x.online && x.lastSeen && (Date.now() - x.lastSeen) < ONLINE_THRESHOLD_MS;
         const dotColor = online ? 'var(--ok)' : '#555';
         const statusText = online ? 'Online now' : ('Last seen ' + timeAgo(x.lastSeen));
         return `
