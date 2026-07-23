@@ -312,6 +312,7 @@
   const JOB_ROLES = ['Technician','Radio Surveyor','Engineer','Coordinator','HR','Other'];
   const DEFAULT_ADMIN_USER = 'admin';
   const DEFAULT_ADMIN_PASS = 'OEAdmin';
+  const SESSION_KEY = 'oe_session_user';
 
   // ---------- Firebase ----------
   // This config is a public identifier, not a secret — access is controlled by Firestore rules, not by hiding this.
@@ -450,10 +451,53 @@
       const hash = await hashPassword(p, rec.salt);
       if(hash !== rec.hash){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — incorrect password.'; return; }
       session = {u: rec.u, status: rec.status};
+      try{ localStorage.setItem(SESSION_KEY, rec.u); }catch(e){}
       ro.classList.remove('err'); ro.classList.add('ok');
       ro.textContent = 'Access granted.';
+      startHeartbeat();
       setTimeout(renderDashboard, 350);
     }
+  }
+
+  // ---------- presence heartbeat ----------
+  // While logged in, quietly stamps this account's lastSeen every 20s so
+  // admins can see who's currently active. Not a real-time push system —
+  // just a freshness timestamp checked against a threshold.
+  const ONLINE_THRESHOLD_MS = 45000;
+  let heartbeatTimer = null;
+  let adminUnsub = null;
+  let adminTickTimer = null;
+  function teardownAdminListener(){
+    if(adminUnsub){ adminUnsub(); adminUnsub = null; }
+    if(adminTickTimer){ clearInterval(adminTickTimer); adminTickTimer = null; }
+  }
+  async function beat(){
+    if(!session) return;
+    try{ await usersCol().doc(session.u).set({lastSeen: Date.now()}, {merge:true}); }
+    catch(e){ console.error('Heartbeat failed.', e); }
+  }
+  function handleVisibility(){
+    if(document.visibilityState === 'visible') beat();
+  }
+  function startHeartbeat(){
+    beat();
+    if(heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(beat, 20000);
+    document.addEventListener('visibilitychange', handleVisibility);
+  }
+  function stopHeartbeat(){
+    if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    document.removeEventListener('visibilitychange', handleVisibility);
+  }
+  function timeAgo(ts){
+    if(!ts) return 'never';
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if(s < 60) return 'just now';
+    const m = Math.floor(s/60);
+    if(m < 60) return m + ' min ago';
+    const h = Math.floor(m/60);
+    if(h < 24) return h + ' hr ago';
+    return Math.floor(h/24) + ' d ago';
   }
 
   // ---------- dashboard ----------
@@ -478,13 +522,17 @@
         <div id="tabContent"></div>
       </div>
     `;
-    document.getElementById('logoutLink').addEventListener('click', (e)=>{
+    document.getElementById('logoutLink').addEventListener('click', async (e)=>{
       e.preventDefault();
+      teardownAdminListener();
+      stopHeartbeat();
+      try{ await usersCol().doc(session.u).set({lastSeen: 0}, {merge:true}); }catch(err){}
+      try{ localStorage.removeItem(SESSION_KEY); }catch(err){}
       session = null;
       boot();
     });
     Array.from(document.querySelectorAll('.tab')).forEach(btn=>{
-      btn.addEventListener('click', ()=> renderDashboard(btn.dataset.tab));
+      btn.addEventListener('click', ()=>{ teardownAdminListener(); renderDashboard(btn.dataset.tab); });
     });
     document.querySelectorAll('.tab').forEach(b=>{
       if(b.dataset.tab === tab) b.classList.add('active');
@@ -538,10 +586,17 @@
 
     function renderList(list){
       const ul = document.getElementById('userlist');
-      ul.innerHTML = list.map(x => `
+      ul.innerHTML = list.map(x => {
+        const online = x.lastSeen && (Date.now() - x.lastSeen) < ONLINE_THRESHOLD_MS;
+        const dotColor = online ? 'var(--ok)' : '#555';
+        const statusText = online ? 'Online now' : ('Last seen ' + timeAgo(x.lastSeen));
+        return `
         <div class="urow" style="flex-direction:column; align-items:stretch; gap:8px;">
           <div style="display:flex; align-items:center; justify-content:space-between;">
-            <div><span class="name">${x.u}</span><span class="role">${x.status} · ${x.jobRole || '—'}</span></div>
+            <div>
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};margin-right:7px;"></span>
+              <span class="name">${x.u}</span><span class="role">${x.status} · ${x.jobRole || '—'} · ${statusText}</span>
+            </div>
             <div style="display:flex; gap:6px;">
               <button class="btn ghost small" data-edit="${x.u}">Edit</button>
               <button class="btn danger small" data-del="${x.u}">Remove</button>
@@ -549,7 +604,7 @@
           </div>
           <div class="edit-area hidden" id="edit-${x.u}"></div>
         </div>
-      `).join('');
+      `;}).join('');
 
       ul.querySelectorAll('[data-del]').forEach(btn=>{
         btn.addEventListener('click', async ()=>{
@@ -621,7 +676,14 @@
       });
     }
 
-    renderList(users);
+    let lastKnownUsers = users;
+    renderList(lastKnownUsers);
+    teardownAdminListener();
+    adminUnsub = usersCol().onSnapshot(snap => {
+      lastKnownUsers = snap.docs.map(d => d.data());
+      renderList(lastKnownUsers);
+    }, err => console.error('Live user list error.', err));
+    adminTickTimer = setInterval(()=> renderList(lastKnownUsers), 10000);
 
     document.getElementById('addUserBtn').addEventListener('click', async ()=>{
       const u = document.getElementById('nu').value.trim().toLowerCase();
@@ -648,6 +710,8 @@
   // ---------- boot ----------
   async function boot(){
     session = null;
+    teardownAdminListener();
+    stopHeartbeat();
     root.className = 'app';
     root.innerHTML = `<div class="panel">${rivets()}<div class="plate"><div class="brand">OE <span>FIELD</span> TOOL</div><div class="sub">Connecting…</div></div></div>`;
     try{
@@ -660,6 +724,20 @@
       return;
     }
     await ensureSeedAdmin();
+
+    let savedUser = null;
+    try{ savedUser = localStorage.getItem(SESSION_KEY); }catch(e){}
+    if(savedUser){
+      const rec = await getUser(savedUser);
+      if(rec){
+        session = {u: rec.u, status: rec.status};
+        startHeartbeat();
+        renderDashboard();
+        return;
+      }else{
+        try{ localStorage.removeItem(SESSION_KEY); }catch(e){}
+      }
+    }
     renderGate();
   }
   boot();
