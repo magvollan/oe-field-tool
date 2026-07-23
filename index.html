@@ -65,6 +65,9 @@
     margin:24px;
   }
   .app.wide{max-width:760px;}
+  @media(min-width:900px){
+    .app.wide{max-width:1200px;}
+  }
 
   /* ---------- Panel shell ---------- */
   .panel{
@@ -259,6 +262,7 @@
   .tab.active{border-color:var(--accent); color:var(--accent); background:rgba(217,52,43,0.1);}
   .cards{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
   @media(max-width:520px){.cards{grid-template-columns:1fr;}}
+  @media(min-width:900px){.cards{grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));}}
   .card{
     border:1px solid var(--gray-700);
     border-radius:8px;
@@ -688,7 +692,7 @@
 
       ${me.status === 'admin' ? `
         <div class="section-title">Admin panel</div>
-        <p style="color:var(--fog-dim); font-size:0.8rem; margin:0 0 10px;">Currently online</p>
+        <p style="color:var(--fog-dim); font-size:0.8rem; margin:0 0 10px;">Activity — all accounts, live status</p>
         <div class="userlist" id="onlineList" style="margin-bottom:22px;"></div>
 
         <p style="color:var(--fog-dim); font-size:0.78rem; text-transform:uppercase; letter-spacing:0.08em; margin:0 0 10px; font-family:'Rajdhani',sans-serif; font-weight:600;">User management</p>
@@ -754,15 +758,18 @@
     function renderOnlineList(list){
       const el = document.getElementById('onlineList');
       if(!el) return;
-      const onlineUsers = list.filter(x => x.online && x.lastSeen && (Date.now() - x.lastSeen) < ONLINE_THRESHOLD_MS);
-      el.innerHTML = onlineUsers.length ? onlineUsers.map(x => `
+      el.innerHTML = list.length ? list.map(x => {
+        const online = x.online && x.lastSeen && (Date.now() - x.lastSeen) < ONLINE_THRESHOLD_MS;
+        const dotColor = online ? 'var(--ok)' : '#555';
+        const statusText = online ? 'Online now' : ('Last seen ' + timeAgo(x.lastSeen));
+        return `
         <div class="urow">
           <div>
-            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:7px;"></span>
-            <span class="name">${x.u}</span><span class="role">${x.primaryRole || '—'}</span>
+            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};margin-right:7px;"></span>
+            <span class="name">${x.u}</span><span class="role">${x.primaryRole || '—'} · ${statusText}</span>
           </div>
         </div>
-      `).join('') : '<div style="color:var(--fog-dim); font-size:0.82rem;">No one online right now.</div>';
+      `;}).join('') : '<div style="color:var(--fog-dim); font-size:0.82rem;">No accounts yet.</div>';
     }
 
     teardownAdminListener();
