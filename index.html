@@ -873,7 +873,7 @@
     tab = tab || 'overview';
     const readable = await getMyReadableSections(); // e.g. ['reference'] — sections this session can see
     const writable = await getMyWritableSections(); // sections this session can add/edit content in
-    if(tab !== 'overview' && tab !== 'settings' && !readable.includes(tab)){
+    if(tab !== 'overview' && tab !== 'settings' && tab !== 'messages' && !readable.includes(tab)){
       tab = 'overview'; // don't render a section they've lost/never had access to
     }
     root.className = 'app wide';
