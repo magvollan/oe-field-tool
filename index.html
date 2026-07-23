@@ -296,6 +296,9 @@
   }
   .hidden{display:none;}
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 
@@ -310,21 +313,48 @@
   const DEFAULT_ADMIN_USER = 'admin';
   const DEFAULT_ADMIN_PASS = 'OEAdmin';
 
+  // ---------- Firebase ----------
+  // This config is a public identifier, not a secret — access is controlled by Firestore rules, not by hiding this.
+  const firebaseConfig = {
+    apiKey: "AIzaSyAw-IJTwUSRneJsjCg-WiI7cSc4iwEjrEw",
+    authDomain: "oe-field-tool.firebaseapp.com",
+    projectId: "oe-field-tool",
+    storageBucket: "oe-field-tool.firebasestorage.app",
+    messagingSenderId: "1089649415892",
+    appId: "1:1089649415892:web:c993832503e3e4aeb58d41"
+  };
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
+  const USERS_COLLECTION = 'users';
+
+  function usersCol(){ return db.collection(USERS_COLLECTION); }
+
   // ---------- storage helpers ----------
-  // Uses this browser's localStorage. Accounts are stored per-device/per-browser —
-  // there is no cross-device sync in this version.
+  // Backed by Firestore. Anonymous auth (silent, no UI) satisfies the security
+  // rules that gate this collection — it is not the app's own login screen.
   async function loadUsers(){
     try{
-      const raw = localStorage.getItem('oe_app_users');
-      return raw ? JSON.parse(raw) : [];
-    }catch(e){ return []; }
-  }
-  async function saveUsers(list){
-    try{
-      localStorage.setItem('oe_app_users', JSON.stringify(list));
+      const snap = await usersCol().get();
+      return snap.docs.map(d => d.data());
     }catch(e){
-      console.error('Could not save accounts — storage may be full or blocked.', e);
+      console.error('Could not load accounts from Firestore.', e);
+      return [];
     }
+  }
+  async function getUser(u){
+    try{
+      const doc = await usersCol().doc(u).get();
+      return doc.exists ? doc.data() : null;
+    }catch(e){
+      console.error('Could not load account from Firestore.', e);
+      return null;
+    }
+  }
+  async function saveUser(userObj){
+    await usersCol().doc(userObj.u).set(userObj);
+  }
+  async function deleteUser(u){
+    await usersCol().doc(u).delete();
   }
   function bufToHex(buf){
     return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
@@ -345,14 +375,13 @@
     return bufToHex(digest);
   }
   async function ensureSeedAdmin(){
-    let users = await loadUsers();
-    if(users.length === 0){
+    const existing = await getUser(DEFAULT_ADMIN_USER);
+    const all = await loadUsers();
+    if(all.length === 0 && !existing){
       const salt = randSaltHex();
       const hash = await hashPassword(DEFAULT_ADMIN_PASS, salt);
-      users = [{u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', jobRole:'Coordinator', created: Date.now()}];
-      await saveUsers(users);
+      await saveUser({u: DEFAULT_ADMIN_USER, salt, hash, status:'admin', jobRole:'Coordinator', created: Date.now()});
     }
-    return users;
   }
 
   // ---------- rivets ----------
@@ -416,8 +445,7 @@
       const p = document.getElementById('lp').value;
       const ro = document.getElementById('loginReadout');
       ro.className = 'readout show';
-      const users = await loadUsers();
-      const rec = users.find(x=>x.u === u);
+      const rec = await getUser(u);
       if(!rec){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — unknown username.'; return; }
       const hash = await hashPassword(p, rec.salt);
       if(hash !== rec.hash){ ro.classList.add('err'); ro.textContent = 'ACCESS DENIED — incorrect password.'; return; }
@@ -530,9 +558,8 @@
           const admins = list2.filter(x=>x.status==='admin');
           if(target === session.u){ flash('You cannot remove the account you are logged in as.'); return; }
           if(admins.length===1 && admins[0].u===target){ flash('Cannot remove the last remaining admin.'); return; }
-          list2 = list2.filter(x=>x.u!==target);
-          await saveUsers(list2);
-          renderList(list2);
+          await deleteUser(target);
+          renderList(await loadUsers());
         });
       });
 
@@ -579,17 +606,16 @@
               newRole = area.querySelector('.e-role-other').value.trim() || 'Other';
             }
             const newPass = area.querySelector('.e-pass').value;
-            list2[idx].status = newStatus;
-            list2[idx].jobRole = newRole;
+            const updated = { ...list2[idx], status: newStatus, jobRole: newRole };
             if(newPass){
               if(newPass.length < 6){ flash('New password should be at least 6 characters.'); return; }
               const salt = randSaltHex();
-              list2[idx].salt = salt;
-              list2[idx].hash = await hashPassword(newPass, salt);
+              updated.salt = salt;
+              updated.hash = await hashPassword(newPass, salt);
             }
-            await saveUsers(list2);
+            await saveUser(updated);
             flash(`Account "${target}" updated.`, true);
-            renderList(list2);
+            renderList(await loadUsers());
           });
         });
       });
@@ -607,22 +633,32 @@
       }
       if(!u || !p){ flash('Username and password are required.'); return; }
       if(p.length < 6){ flash('Password should be at least 6 characters.'); return; }
-      let list = await loadUsers();
-      if(list.find(x=>x.u===u)){ flash('That username already exists.'); return; }
+      const exists = await getUser(u);
+      if(exists){ flash('That username already exists.'); return; }
       const salt = randSaltHex();
       const hash = await hashPassword(p, salt);
-      list.push({u, salt, hash, status, jobRole, created: Date.now()});
-      await saveUsers(list);
+      await saveUser({u, salt, hash, status, jobRole, created: Date.now()});
       flash(`Account "${u}" created.`, true);
       document.getElementById('nu').value=''; document.getElementById('np').value='';
       document.getElementById('nroleOther').value='';
-      renderList(list);
+      renderList(await loadUsers());
     });
   }
 
   // ---------- boot ----------
   async function boot(){
     session = null;
+    root.className = 'app';
+    root.innerHTML = `<div class="panel">${rivets()}<div class="plate"><div class="brand">OE <span>FIELD</span> TOOL</div><div class="sub">Connecting…</div></div></div>`;
+    try{
+      if(!firebase.auth().currentUser){
+        await firebase.auth().signInAnonymously();
+      }
+    }catch(e){
+      console.error('Firebase sign-in failed.', e);
+      root.innerHTML = `<div class="panel">${rivets()}<div class="plate"><div class="brand">OE <span>FIELD</span> TOOL</div></div><div class="readout show err">Could not connect. Check your internet connection and reload.</div></div>`;
+      return;
+    }
     await ensureSeedAdmin();
     renderGate();
   }
