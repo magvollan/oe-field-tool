@@ -373,6 +373,47 @@
   .urow .name{font-family:'IBM Plex Mono',monospace; font-size:0.82rem;}
   .urow .role{color:var(--fog-dim); font-size:0.68rem; margin-left:8px;}
 
+  /* ---------- Library search ---------- */
+  .lib-search-wrap{position:relative;}
+  .lib-search-wrap input{
+    width:100%;
+    background:var(--recessed-bg);
+    border:1px solid var(--gray-700);
+    border-radius:5px;
+    padding:11px 12px;
+    color:var(--fog);
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.9rem;
+    outline:none;
+    transition:border-color 0.2s, box-shadow 0.2s;
+  }
+  .lib-search-wrap input:focus{
+    border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(217,52,43,0.18);
+  }
+  .lib-search-dropdown{
+    position:absolute;
+    top:calc(100% + 6px);
+    left:0; right:0;
+    max-height:280px;
+    overflow-y:auto;
+    background:var(--card-bg);
+    border:1px solid var(--gray-700);
+    border-radius:8px;
+    box-shadow:0 20px 40px -15px rgba(0,0,0,0.6);
+    z-index:50;
+  }
+  .lib-search-result{
+    display:flex; flex-direction:column; gap:2px;
+    padding:10px 12px; cursor:pointer;
+    border-bottom:1px solid var(--gray-700);
+  }
+  .lib-search-result:last-child{border-bottom:none;}
+  .lib-search-result:hover, .lib-search-result.active{background:var(--recessed-bg);}
+  .lib-search-result .name{font-family:'IBM Plex Mono',monospace; font-size:0.82rem; color:var(--fog);}
+  .lib-search-result .path{color:var(--fog-dim); font-size:0.66rem;}
+  .lib-search-empty{padding:12px; color:var(--fog-dim); font-size:0.8rem;}
+
   .section-title{
     font-family:'Rajdhani',sans-serif; font-weight:600; letter-spacing:0.08em;
     text-transform:uppercase; font-size:0.85rem; color:var(--fog-dim);
@@ -957,8 +998,91 @@
   // ---------- library ----------
   async function renderLibrary(content, canWrite){
     let path = []; // breadcrumb trail: [{id, name}, ...] — empty = root
-    content.innerHTML = `<div id="libraryView"></div>`;
+    let searchIndex = []; // flat cache of every item in the whole library, for search only
+
+    content.innerHTML = `
+      <div class="lib-search-wrap" style="margin-bottom:16px;">
+        <input id="libSearchInput" placeholder="Search library…" autocomplete="off">
+        <div id="libSearchResults" class="lib-search-dropdown" style="display:none;"></div>
+      </div>
+      <div id="libraryView"></div>
+    `;
     const view = document.getElementById('libraryView');
+    const searchInputEl = document.getElementById('libSearchInput');
+    const searchResultsEl = document.getElementById('libSearchResults');
+
+    async function refreshSearchIndex(){
+      try{
+        const snap = await libraryCol().get();
+        searchIndex = snap.docs.map(d => ({id: d.id, ...d.data()}));
+      }catch(e){ console.error('Could not load library search index.', e); }
+    }
+
+    // Walk parentId links up to the root so a search result can jump straight
+    // to the right spot in the breadcrumb trail, wherever it lives.
+    async function ancestorsOf(parentId){
+      const chain = [];
+      let currentId = parentId;
+      while(currentId){
+        const it = searchIndex.find(x => x.id === currentId) || await getLibraryItem(currentId);
+        if(!it) break;
+        chain.unshift({id: it.id, name: it.name});
+        currentId = it.parentId;
+      }
+      return chain;
+    }
+
+    function hideSearchResults(){
+      searchResultsEl.style.display = 'none';
+      searchResultsEl.innerHTML = '';
+    }
+
+    function renderSearchResults(query){
+      const q = query.trim().toLowerCase();
+      if(!q){ hideSearchResults(); return; }
+      const matches = searchIndex.filter(it =>
+        (it.name || '').toLowerCase().includes(q) ||
+        (it.type === 'file' && (it.description || '').toLowerCase().includes(q))
+      ).slice(0, 40);
+
+      if(matches.length === 0){
+        searchResultsEl.innerHTML = '<div class="lib-search-empty">No matches.</div>';
+        searchResultsEl.style.display = 'block';
+        return;
+      }
+      searchResultsEl.innerHTML = matches.map(it => `
+        <div class="lib-search-result" data-searchitem="${it.id}">
+          <span class="name">${it.type === 'folder' ? '&#128193;' : '&#128196;'} ${it.name}</span>
+          <span class="path">${it.type === 'folder' ? 'Folder' : 'File'}</span>
+        </div>
+      `).join('');
+      searchResultsEl.style.display = 'block';
+
+      searchResultsEl.querySelectorAll('[data-searchitem]').forEach(row=>{
+        row.addEventListener('mousedown', async (e)=>{
+          e.preventDefault(); // keep focus/blur order sane so this fires before the input's blur hides the dropdown
+          const item = searchIndex.find(x => x.id === row.dataset.searchitem);
+          if(!item) return;
+          hideSearchResults();
+          searchInputEl.value = '';
+          if(item.type === 'folder'){
+            const ancestors = await ancestorsOf(item.parentId);
+            path = [...ancestors, {id: item.id, name: item.name}];
+            renderFolder();
+          }else{
+            const ancestors = await ancestorsOf(item.parentId);
+            path = ancestors;
+            renderFolder();
+            window.open(item.url, '_blank', 'noopener');
+          }
+        });
+      });
+    }
+
+    searchInputEl.addEventListener('input', (e)=> renderSearchResults(e.target.value));
+    searchInputEl.addEventListener('focus', (e)=>{ if(e.target.value.trim()) renderSearchResults(e.target.value); });
+    searchInputEl.addEventListener('blur', ()=> setTimeout(hideSearchResults, 120));
+    searchInputEl.addEventListener('keydown', (e)=>{ if(e.key === 'Escape'){ hideSearchResults(); searchInputEl.blur(); } });
 
     async function renderFolder(){
       const parentId = path.length ? path[path.length-1].id : null;
@@ -1020,6 +1144,7 @@
             e.stopPropagation();
             if(!confirm('Remove this item? This cannot be undone — removing a folder also removes everything inside it.')) return;
             await deleteLibraryItemRecursive(btn.dataset.delitem);
+            await refreshSearchIndex();
             renderFolder();
           });
         });
@@ -1039,6 +1164,7 @@
             const name = body.querySelector('#newFolderName').value.trim();
             if(!name){ mflash('Enter a folder name.'); return; }
             await addLibraryFolder(name, parentId);
+            await refreshSearchIndex();
             mflash('Folder created.', true);
             setTimeout(()=>{ closeModal(); renderFolder(); }, 500);
           });
@@ -1064,6 +1190,7 @@
             if(!name || !url){ mflash('Name and link are required.'); return; }
             if(!/^https?:\/\//i.test(url)){ mflash('Link should start with http:// or https://'); return; }
             await addLibraryFile(name, description, url, parentId);
+            await refreshSearchIndex();
             mflash('File added.', true);
             setTimeout(()=>{ closeModal(); renderFolder(); }, 500);
           });
@@ -1071,6 +1198,7 @@
       }
     }
 
+    await refreshSearchIndex();
     await renderFolder();
   }
 
