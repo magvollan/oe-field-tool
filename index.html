@@ -414,6 +414,41 @@
   .lib-search-result .path{color:var(--fog-dim); font-size:0.66rem;}
   .lib-search-empty{padding:12px; color:var(--fog-dim); font-size:0.8rem;}
 
+  /* ---------- Trello widget ---------- */
+  .trello-controls{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px;}
+  .trello-controls select{
+    background:var(--recessed-bg);
+    border:1px solid var(--gray-700);
+    border-radius:5px;
+    padding:9px 10px;
+    color:var(--fog);
+    font-family:'IBM Plex Mono',monospace;
+    font-size:0.82rem;
+    outline:none;
+    max-width:100%;
+  }
+  .trello-card{
+    border:1px solid var(--gray-700); border-radius:8px;
+    padding:12px 14px; background:var(--card-bg); margin-bottom:10px;
+  }
+  .trello-card-top{
+    display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;
+  }
+  .trello-card-name{font-family:'IBM Plex Mono',monospace; font-size:0.86rem; color:var(--fog);}
+  .trello-due{
+    font-size:0.65rem; font-family:'IBM Plex Mono',monospace; letter-spacing:0.05em;
+    padding:2px 7px; border-radius:20px; border:1px solid var(--gray-700); color:var(--fog-dim); white-space:nowrap;
+  }
+  .trello-due.overdue{color:var(--err-text); border-color:rgba(192,69,58,0.6);}
+  .trello-due.done{color:var(--ok-text); border-color:rgba(76,140,107,0.6);}
+  .trello-checklist{margin-top:10px; display:flex; flex-direction:column; gap:6px;}
+  .trello-checkitem{
+    display:flex; align-items:center; gap:8px; font-size:0.8rem; color:var(--fog-dim);
+  }
+  .trello-checkitem input{width:15px; height:15px; accent-color:var(--accent);}
+  .trello-checkitem.complete{text-decoration:line-through; color:var(--fog-dim); opacity:0.7;}
+  .trello-move-select{margin-top:8px;}
+
   .section-title{
     font-family:'Rajdhani',sans-serif; font-weight:600; letter-spacing:0.08em;
     text-transform:uppercase; font-size:0.85rem; color:var(--fog-dim);
@@ -776,6 +811,38 @@
     return SECTIONS.filter(s => readable.has(s.key)).map(s=>s.key);
   }
 
+  // ---------- trello integration ----------
+  // App-level API key (identifies this app to Trello) — set once by an admin, stored in Firestore.
+  // Each person then connects their own Trello *token* separately (stored on their own user doc),
+  // so every action Trello sees is performed as that person, not through one shared login.
+  const TRELLO_API_BASE = 'https://api.trello.com/1';
+  async function getTrelloAppKey(){
+    try{
+      const doc = await metaDoc('trelloConfig').get();
+      return doc.exists ? (doc.data().apiKey || '') : '';
+    }catch(e){ console.error('Could not load Trello config.', e); return ''; }
+  }
+  async function saveTrelloAppKey(apiKey){
+    await metaDoc('trelloConfig').set({apiKey});
+  }
+  function trelloAuthorizeUrl(apiKey){
+    return `https://trello.com/1/authorize?expiration=never&name=${encodeURIComponent('OE Field Tool')}&scope=read,write&response_type=token&key=${encodeURIComponent(apiKey)}`;
+  }
+  async function trelloRequest(path, apiKey, token, params, method){
+    const url = new URL(TRELLO_API_BASE + path);
+    url.searchParams.set('key', apiKey);
+    url.searchParams.set('token', token);
+    Object.entries(params || {}).forEach(([k,v]) => url.searchParams.set(k, String(v)));
+    const res = await fetch(url.toString(), {method: method || 'GET'});
+    if(!res.ok){
+      let msg = 'Trello request failed (' + res.status + ')';
+      try{ const body = await res.text(); if(body) msg = body; }catch(e){}
+      throw new Error(msg);
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
+
   // ---------- rivets ----------
   function rivets(){
     return '<span class="rivet tl"></span><span class="rivet tr"></span><span class="rivet bl"></span><span class="rivet br"></span>';
@@ -976,14 +1043,7 @@
 
     const content = document.getElementById('tabContent');
     if(tab === 'overview'){
-      const tag = (key) => session.status==='admin' ? 'Available' : (readable.includes(key) ? 'Available' : 'No access');
-      content.innerHTML = `
-        <div class="cards">
-          <div class="card"><h3>Checklists &amp; Jobs</h3><p>Job checklists, notes and photos per vessel.</p><span class="tag">Not installed yet</span></div>
-          <div class="card"><h3>Library</h3><p>Manuals, datasheets and technical documents.</p><span class="tag">${tag('reference')}</span></div>
-          <div class="card"><h3>Calculators</h3><p>Cable sizing, fuse lists and conversions.</p><span class="tag">${tag('calculators')}</span></div>
-        </div>
-      `;
+      renderOverview(content, readable);
     } else if(tab === 'messages'){
       renderMessages(content);
     } else if(tab === 'reference'){
@@ -993,6 +1053,258 @@
     } else if(tab === 'settings'){
       renderSettings(content);
     }
+  }
+
+  // ---------- overview + trello widget ----------
+  async function renderOverview(content, readable){
+    const tag = (key) => session.status==='admin' ? 'Available' : (readable.includes(key) ? 'Available' : 'No access');
+    content.innerHTML = `
+      <div class="cards">
+        <div class="card"><h3>Checklists &amp; Jobs</h3><p>Job checklists, notes and photos per vessel.</p><span class="tag">Not installed yet</span></div>
+        <div class="card"><h3>Library</h3><p>Manuals, datasheets and technical documents.</p><span class="tag">${tag('reference')}</span></div>
+        <div class="card"><h3>Calculators</h3><p>Cable sizing, fuse lists and conversions.</p><span class="tag">${tag('calculators')}</span></div>
+      </div>
+      <div class="section-title">Trello</div>
+      <div id="trelloWidget"></div>
+    `;
+    await renderTrelloWidget(document.getElementById('trelloWidget'));
+  }
+
+  async function renderTrelloWidget(box){
+    box.innerHTML = '<div style="color:var(--fog-dim); font-size:0.82rem;">Loading…</div>';
+    const appKey = await getTrelloAppKey();
+    const me = await getUser(session.u);
+
+    // ---- Stage 1: nobody has configured the app-level API key yet ----
+    if(!appKey){
+      if(session.status === 'admin'){
+        box.innerHTML = `
+          <div class="card">
+            <p style="margin:0 0 10px; color:var(--fog-dim); font-size:0.85rem;">
+              Trello hasn't been connected to this app yet. Create a free API key for this app at
+              <a href="https://trello.com/power-ups/admin" target="_blank" rel="noopener" style="color:var(--accent);">trello.com/power-ups/admin</a>
+              (or the simpler <a href="https://trello.com/app-key" target="_blank" rel="noopener" style="color:var(--accent);">trello.com/app-key</a> page), then paste it below.
+              This only needs to be done once — everyone will still connect their own Trello account individually after this.
+            </p>
+            <div class="field"><label>Trello API key</label><input id="trelloAppKeyInput" autocomplete="off"></div>
+            <button class="btn" id="saveTrelloAppKeyBtn" style="width:auto;">Save API key</button>
+            <div class="readout" id="trelloAppKeyReadout"></div>
+          </div>
+        `;
+        const flash = (msg, ok) => {
+          const ro = document.getElementById('trelloAppKeyReadout');
+          ro.className = 'readout show ' + (ok ? 'ok' : 'err');
+          ro.textContent = msg;
+        };
+        document.getElementById('saveTrelloAppKeyBtn').addEventListener('click', async ()=>{
+          const key = document.getElementById('trelloAppKeyInput').value.trim();
+          if(!key){ flash('Enter an API key.'); return; }
+          try{
+            await saveTrelloAppKey(key);
+            flash('Saved. Reloading…', true);
+            setTimeout(()=> renderTrelloWidget(box), 600);
+          }catch(e){
+            console.error('Could not save Trello API key.', e);
+            flash('Could not save the API key.');
+          }
+        });
+      }else{
+        box.innerHTML = `<div class="card"><p style="margin:0; color:var(--fog-dim); font-size:0.85rem;">Trello hasn't been set up yet. Ask an admin to add the Trello API key here in Overview.</p></div>`;
+      }
+      return;
+    }
+
+    // ---- Stage 2: app key exists, but this person hasn't connected their own Trello account ----
+    if(!me.trelloToken){
+      box.innerHTML = `
+        <div class="card">
+          <p style="margin:0 0 10px; color:var(--fog-dim); font-size:0.85rem;">Connect your own Trello account to browse and work with your boards here.</p>
+          <button class="btn ghost" id="trelloConnectBtn" style="width:auto;">Connect Trello</button>
+          <div class="field" style="margin-top:12px;"><label>Paste the token Trello gives you after authorizing</label><input id="trelloTokenInput" autocomplete="off"></div>
+          <button class="btn" id="saveTrelloTokenBtn" style="width:auto;">Save token</button>
+          <div class="readout" id="trelloConnectReadout"></div>
+        </div>
+      `;
+      document.getElementById('trelloConnectBtn').addEventListener('click', ()=>{
+        window.open(trelloAuthorizeUrl(appKey), '_blank', 'noopener');
+      });
+      const flash = (msg, ok) => {
+        const ro = document.getElementById('trelloConnectReadout');
+        ro.className = 'readout show ' + (ok ? 'ok' : 'err');
+        ro.textContent = msg;
+      };
+      document.getElementById('saveTrelloTokenBtn').addEventListener('click', async ()=>{
+        const token = document.getElementById('trelloTokenInput').value.trim();
+        if(!token){ flash('Paste your token first.'); return; }
+        try{
+          await trelloRequest('/members/me', appKey, token, {fields:'username'}); // verify it actually works before saving
+          await saveUser({...me, trelloToken: token});
+          flash('Connected. Loading your boards…', true);
+          setTimeout(()=> renderTrelloWidget(box), 500);
+        }catch(e){
+          console.error('Trello token check failed.', e);
+          flash("That token didn't work — double check you copied the whole thing.");
+        }
+      });
+      return;
+    }
+
+    // ---- Stage 3: connected — board / list pickers + cards ----
+    let boards = [];
+    try{
+      boards = await trelloRequest('/members/me/boards', appKey, me.trelloToken, {fields:'name', filter:'open'});
+    }catch(e){
+      console.error('Could not load Trello boards.', e);
+      box.innerHTML = `
+        <div class="card">
+          <p style="margin:0 0 10px; color:var(--err-text); font-size:0.85rem;">Could not reach Trello with your saved connection. It may have expired or been revoked.</p>
+          <button class="btn ghost" id="trelloDisconnectBtn" style="width:auto;">Disconnect &amp; reconnect</button>
+        </div>
+      `;
+      document.getElementById('trelloDisconnectBtn').addEventListener('click', async ()=>{
+        await saveUser({...me, trelloToken: '', trelloBoardId: '', trelloListId: ''});
+        renderTrelloWidget(box);
+      });
+      return;
+    }
+
+    let boardId = me.trelloBoardId && boards.find(b=>b.id===me.trelloBoardId) ? me.trelloBoardId : (boards[0] ? boards[0].id : '');
+
+    let lists = [];
+    if(boardId){
+      try{ lists = await trelloRequest(`/boards/${boardId}/lists`, appKey, me.trelloToken, {fields:'name', filter:'open'}); }
+      catch(e){ console.error('Could not load Trello lists.', e); }
+    }
+    let listId = me.trelloListId && lists.find(l=>l.id===me.trelloListId) ? me.trelloListId : (lists[0] ? lists[0].id : '');
+
+    box.innerHTML = `
+      <div class="trello-controls">
+        <select id="trelloBoardSelect">
+          ${boards.length ? boards.map(b => `<option value="${b.id}" ${b.id===boardId?'selected':''}>${escapeHtmlOverview(b.name)}</option>`).join('') : '<option value="">No boards available</option>'}
+        </select>
+        <select id="trelloListSelect">
+          ${lists.length ? lists.map(l => `<option value="${l.id}" ${l.id===listId?'selected':''}>${escapeHtmlOverview(l.name)}</option>`).join('') : '<option value="">No lists</option>'}
+        </select>
+        <button class="btn ghost small" id="trelloRefreshBtn" type="button">Refresh</button>
+        <button class="btn ghost small" id="trelloDisconnectBtn2" type="button">Disconnect</button>
+      </div>
+      <div id="trelloCardsBox"></div>
+    `;
+
+    document.getElementById('trelloDisconnectBtn2').addEventListener('click', async ()=>{
+      if(!confirm('Disconnect your Trello account from this app?')) return;
+      await saveUser({...me, trelloToken: '', trelloBoardId: '', trelloListId: ''});
+      renderTrelloWidget(box);
+    });
+    document.getElementById('trelloRefreshBtn').addEventListener('click', ()=> loadAndRenderCards(listId, lists));
+
+    document.getElementById('trelloBoardSelect').addEventListener('change', async (e)=>{
+      const newBoardId = e.target.value;
+      await saveUser({...me, trelloBoardId: newBoardId, trelloListId: ''}); // list choice doesn't carry over to a different board
+      renderTrelloWidget(box);
+    });
+    document.getElementById('trelloListSelect').addEventListener('change', async (e)=>{
+      const newListId = e.target.value;
+      listId = newListId;
+      await saveUser({...me, trelloBoardId: boardId, trelloListId: newListId});
+      loadAndRenderCards(newListId, lists);
+    });
+
+    function escapeHtmlOverview(str){
+      const d = document.createElement('div');
+      d.textContent = str || '';
+      return d.innerHTML;
+    }
+
+    function formatDue(card){
+      if(!card.due) return '';
+      const due = new Date(card.due);
+      const label = due.toLocaleDateString(undefined, {month:'short', day:'numeric'});
+      if(card.dueComplete) return `<span class="trello-due done">Done · ${label}</span>`;
+      if(due.getTime() < Date.now()) return `<span class="trello-due overdue">Overdue · ${label}</span>`;
+      return `<span class="trello-due">Due ${label}</span>`;
+    }
+
+    async function loadAndRenderCards(currentListId, listOptions){
+      const cardsBox = document.getElementById('trelloCardsBox');
+      if(!cardsBox) return;
+      if(!currentListId){
+        cardsBox.innerHTML = '<div style="color:var(--fog-dim); font-size:0.82rem;">Pick a list to see its cards.</div>';
+        return;
+      }
+      cardsBox.innerHTML = '<div style="color:var(--fog-dim); font-size:0.82rem;">Loading cards…</div>';
+      let cards = [];
+      try{
+        cards = await trelloRequest(`/lists/${currentListId}/cards`, appKey, me.trelloToken, {
+          fields: 'name,due,dueComplete,idList',
+          checklists: 'all',
+          checklist_fields: 'name'
+        });
+      }catch(e){
+        console.error('Could not load Trello cards.', e);
+        cardsBox.innerHTML = '<div style="color:var(--err-text); font-size:0.82rem;">Could not load cards for this list.</div>';
+        return;
+      }
+      if(cards.length === 0){
+        cardsBox.innerHTML = '<div style="color:var(--fog-dim); font-size:0.82rem;">No cards in this list.</div>';
+        return;
+      }
+      cardsBox.innerHTML = cards.map(card => {
+        const checkItems = (card.checklists || []).flatMap(cl => cl.checkItems || []);
+        return `
+          <div class="trello-card" data-cardid="${card.id}">
+            <div class="trello-card-top">
+              <span class="trello-card-name">${escapeHtmlOverview(card.name)}</span>
+              ${formatDue(card)}
+            </div>
+            <select class="trello-move-select" data-movecard="${card.id}">
+              ${listOptions.map(l => `<option value="${l.id}" ${l.id===card.idList?'selected':''}>${escapeHtmlOverview(l.name)}</option>`).join('')}
+            </select>
+            ${checkItems.length ? `
+              <div class="trello-checklist">
+                ${checkItems.map(ci => `
+                  <label class="trello-checkitem ${ci.state==='complete'?'complete':''}">
+                    <input type="checkbox" data-cardid="${card.id}" data-itemid="${ci.id}" ${ci.state==='complete'?'checked':''}>
+                    ${escapeHtmlOverview(ci.name)}
+                  </label>
+                `).join('')}
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+
+      cardsBox.querySelectorAll('[data-movecard]').forEach(sel=>{
+        sel.addEventListener('change', async (e)=>{
+          const cardId = e.target.dataset.movecard;
+          const newListId = e.target.value;
+          try{
+            await trelloRequest(`/cards/${cardId}`, appKey, me.trelloToken, {idList: newListId}, 'PUT');
+            loadAndRenderCards(currentListId, listOptions); // card's moved off this list now, so refresh the view
+          }catch(e2){
+            console.error('Could not move Trello card.', e2);
+            alert("Could not move that card — it may need to be moved from Trello directly.");
+          }
+        });
+      });
+      cardsBox.querySelectorAll('[data-itemid]').forEach(cb=>{
+        cb.addEventListener('change', async (e)=>{
+          const cardId = e.target.dataset.cardid;
+          const itemId = e.target.dataset.itemid;
+          const newState = e.target.checked ? 'complete' : 'incomplete';
+          try{
+            await trelloRequest(`/cards/${cardId}/checkItem/${itemId}`, appKey, me.trelloToken, {state: newState}, 'PUT');
+            e.target.closest('.trello-checkitem').classList.toggle('complete', e.target.checked);
+          }catch(e2){
+            console.error('Could not update Trello checklist item.', e2);
+            e.target.checked = !e.target.checked; // revert the optimistic UI change
+            alert('Could not update that checklist item.');
+          }
+        });
+      });
+    }
+
+    await loadAndRenderCards(listId, lists);
   }
 
   // ---------- library ----------
