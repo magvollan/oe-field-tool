@@ -491,11 +491,20 @@
   async function setReadReceipt(user, channel, ts){
     await receiptsCol().doc(receiptDocId(user, channel)).set({user, channel, lastReadTs: ts});
   }
+  // Per-user "clear chat" — hides everything before clearedAt for that one user only.
+  // The messages themselves are untouched, so the other side keeps their full history
+  // and has to clear their own copy separately if they want to.
+  function chatClearsCol(){ return db.collection('chat_clears'); }
+  function clearDocId(user, channel){ return user + '__' + channel; }
+  async function setChatClear(user, channel, ts){
+    await chatClearsCol().doc(clearDocId(user, channel)).set({user, channel, clearedAt: ts});
+  }
 
   // ---------- unread tracking (badges + tab flag) ----------
   // Runs in the background for the whole session, not just while the Messages tab is open,
   // so the tab's exclamation flag stays accurate no matter where you're navigating.
   let myReadReceipts = {};       // channel -> lastReadTs (mine)
+  let myClearedAt = {};          // channel -> clearedAt (mine) — messages before this are hidden from me only
   let allRelevantMessages = [];  // latest snapshot of every message across my channels
   let unreadCounts = {};         // channel -> unread count
   let totalUnread = 0;
@@ -510,7 +519,8 @@
     allRelevantMessages.forEach(m=>{
       if(m.from === session.u) return; // never count your own messages as unread
       const lastRead = myReadReceipts[m.channel] || 0;
-      if(m.timestamp > lastRead) counts[m.channel] = (counts[m.channel] || 0) + 1;
+      const clearedAt = myClearedAt[m.channel] || 0;
+      if(m.timestamp > lastRead && m.timestamp > clearedAt) counts[m.channel] = (counts[m.channel] || 0) + 1;
     });
     unreadCounts = counts;
     totalUnread = Object.values(counts).reduce((a,b)=>a+b, 0);
@@ -535,10 +545,15 @@
     teardownMessageWatch();
     const channelIds = await getMyChannelIds();
     myReadReceipts = {};
+    myClearedAt = {};
     try{
       const snap = await receiptsCol().where('user', '==', session.u).get();
       snap.docs.forEach(d => { const data = d.data(); myReadReceipts[data.channel] = data.lastReadTs; });
     }catch(e){ console.error('Could not load read receipts.', e); }
+    try{
+      const clearSnap = await chatClearsCol().where('user', '==', session.u).get();
+      clearSnap.docs.forEach(d => { const data = d.data(); myClearedAt[data.channel] = data.clearedAt; });
+    }catch(e){ console.error('Could not load chat clears.', e); }
     if(channelIds.length === 0) return;
     globalMsgUnsub = messagesCol().where('channel', 'in', channelIds.slice(0,30))
       .onSnapshot(snap => {
@@ -1071,6 +1086,9 @@
     content.innerHTML = `
       <div class="convo-switcher" id="convoSwitcher"></div>
       <div id="dmHeader" style="margin-bottom:10px; font-size:0.85rem; display:none;"></div>
+      <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
+        <button class="btn ghost small" id="clearChatBtn" type="button">Clear chat</button>
+      </div>
       <div class="chat-thread" id="chatThread"></div>
       <div id="seenLine" class="seen-line"></div>
       <div class="chat-input-row">
@@ -1141,7 +1159,9 @@
       messagesUnsub = messagesCol().where('channel', '==', channel).orderBy('timestamp', 'asc')
         .onSnapshot(snap => {
           const msgs = snap.docs.map(d => ({id: d.id, ...d.data()}));
-          renderThread(msgs);
+          const clearedAt = myClearedAt[channel] || 0;
+          const visible = msgs.filter(m => m.timestamp > clearedAt); // hide anything I've cleared, mine only
+          renderThread(visible);
           markChannelRead(channel); // viewing it counts as read, including new messages that arrive while open
         }, err => {
           console.error('Message listener error.', err);
@@ -1214,6 +1234,20 @@
     document.getElementById('chatInput').addEventListener('keydown', (e)=>{
       if(e.key === 'Enter') doSend();
     });
+
+    async function clearCurrentChat(){
+      const ok = confirm(`Clear ${activeLabel} chat? This only clears it on your end — the other side will still see the full history and needs to clear it themselves.`);
+      if(!ok) return;
+      const ts = Date.now();
+      myClearedAt[activeChannel] = ts; // optimistic — thread empties immediately
+      try{
+        await setChatClear(session.u, activeChannel, ts);
+      }catch(e){
+        console.error('Could not save chat clear.', e);
+      }
+      subscribeToChannel(activeChannel); // re-subscribe so the current snapshot is re-filtered right away
+    }
+    document.getElementById('clearChatBtn').addEventListener('click', clearCurrentChat);
 
     subscribeToChannel(activeChannel);
   }
