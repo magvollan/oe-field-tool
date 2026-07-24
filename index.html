@@ -1105,7 +1105,7 @@
             setTimeout(()=> renderTrelloWidget(box), 600);
           }catch(e){
             console.error('Could not save Trello API key.', e);
-            flash('Could not save the API key.');
+            flash('Could not save the API key: ' + (e.message || 'unknown error'));
           }
         });
       }else{
@@ -1138,13 +1138,22 @@
         if(!token){ flash('Paste your token first.'); return; }
         try{
           await trelloRequest('/members/me', appKey, token, {fields:'username'}); // verify it actually works before saving
-          await saveUser({...me, trelloToken: token});
-          flash('Connected. Loading your boards…', true);
-          setTimeout(()=> renderTrelloWidget(box), 500);
         }catch(e){
           console.error('Trello token check failed.', e);
           flash("That token didn't work — double check you copied the whole thing.");
+          return;
         }
+        try{
+          await saveUser({...me, trelloToken: token});
+        }catch(e){
+          // Split from the block above on purpose: a bad Trello token and a failed Firestore
+          // write look the same to the person unless we say which one actually happened.
+          console.error('Could not save Trello token to Firestore.', e);
+          flash('Trello accepted the token, but saving it failed: ' + (e.message || 'unknown error') + '. This is usually a Firestore security rules issue — check that the "users" collection allows writing a trelloToken field.');
+          return;
+        }
+        flash('Connected. Loading your boards…', true);
+        setTimeout(()=> renderTrelloWidget(box), 500);
       });
       return;
     }
