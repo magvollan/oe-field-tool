@@ -1037,6 +1037,20 @@
       searchResultsEl.innerHTML = '';
     }
 
+    // Builds a readable "Library / Parent / Subfolder" trail for where an item lives,
+    // using the in-memory index only (sync — no need to hit Firestore per result row).
+    function pathLabelOf(item){
+      const chain = [];
+      let currentId = item.parentId;
+      while(currentId){
+        const it = searchIndex.find(x => x.id === currentId);
+        if(!it) break;
+        chain.unshift(it.name);
+        currentId = it.parentId;
+      }
+      return ['Library', ...chain].join(' / ');
+    }
+
     function renderSearchResults(query){
       const q = query.trim().toLowerCase();
       if(!q){ hideSearchResults(); return; }
@@ -1053,7 +1067,7 @@
       searchResultsEl.innerHTML = matches.map(it => `
         <div class="lib-search-result" data-searchitem="${it.id}">
           <span class="name">${it.type === 'folder' ? '&#128193;' : '&#128196;'} ${it.name}</span>
-          <span class="path">${it.type === 'folder' ? 'Folder' : 'File'}</span>
+          <span class="path">${pathLabelOf(it)}</span>
         </div>
       `).join('');
       searchResultsEl.style.display = 'block';
