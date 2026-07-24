@@ -525,7 +525,10 @@
     }
     document.querySelectorAll('.convo-btn').forEach(btn=>{
       const count = unreadCounts[btn.dataset.channel] || 0;
-      btn.innerHTML = btn.dataset.label + (count > 0 ? `<span class="unread-badge">${count}</span>` : '');
+      const badgeEl = btn.querySelector('.convo-badge');
+      if(badgeEl){
+        badgeEl.innerHTML = count > 0 ? `<span class="unread-badge">${count}</span>` : '';
+      }
     });
   }
   async function startMessageWatch(){
@@ -827,6 +830,8 @@
   let adminTickTimer = null;
   let messagesUnsub = null;
   let seenUnsub = null;
+  let messagesUsersUnsub = null;
+  let usersStatusMap = {}; // username -> {online, lastSeen} — kept live while Messages tab is open
   function teardownAdminListener(){
     if(adminUnsub){ adminUnsub(); adminUnsub = null; }
     if(adminTickTimer){ clearInterval(adminTickTimer); adminTickTimer = null; }
@@ -834,6 +839,16 @@
   function teardownMessagesListener(){
     if(messagesUnsub){ messagesUnsub(); messagesUnsub = null; }
     if(seenUnsub){ seenUnsub(); seenUnsub = null; }
+    if(messagesUsersUnsub){ messagesUsersUnsub(); messagesUsersUnsub = null; }
+  }
+  function isOnline(username){
+    const s = usersStatusMap[username];
+    return !!(s && s.online && s.lastSeen && (Date.now() - s.lastSeen) < ONLINE_THRESHOLD_MS);
+  }
+  function statusDotHtml(username){
+    if(!(username in usersStatusMap)) return '';
+    const color = isOnline(username) ? 'var(--ok)' : '#555';
+    return `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${color};margin-right:6px;"></span>`;
   }
   async function beat(){
     if(!session) return;
@@ -1055,6 +1070,7 @@
 
     content.innerHTML = `
       <div class="convo-switcher" id="convoSwitcher"></div>
+      <div id="dmHeader" style="margin-bottom:10px; font-size:0.85rem; display:none;"></div>
       <div class="chat-thread" id="chatThread"></div>
       <div id="seenLine" class="seen-line"></div>
       <div class="chat-input-row">
@@ -1064,17 +1080,43 @@
     `;
 
     const switcherEl = document.getElementById('convoSwitcher');
-    function badgeFor(channel){
-      const count = unreadCounts[channel] || 0;
-      return count > 0 ? `<span class="unread-badge">${count}</span>` : '';
-    }
     switcherEl.innerHTML = `
-      <button class="convo-btn active" data-channel="team" data-label="Team" data-other="">Team${badgeFor('team')}</button>
+      <button class="convo-btn active" data-channel="team" data-label="Team" data-other="">
+        <span class="convo-dot"></span><span class="convo-label">Team</span><span class="convo-badge"></span>
+      </button>
       ${others.map(u => {
         const ch = dmChannelId(session.u, u.u);
-        return `<button class="convo-btn" data-channel="${ch}" data-label="${(u.fullName || u.u)}" data-other="${u.u}">${(u.fullName || u.u)}${badgeFor(ch)}</button>`;
+        const label = u.fullName || u.u;
+        return `<button class="convo-btn" data-channel="${ch}" data-label="${label}" data-other="${u.u}">
+          <span class="convo-dot"></span><span class="convo-label">${label}</span><span class="convo-badge"></span>
+        </button>`;
       }).join('')}
     `;
+    updateUnreadUI(); // reflect already-known unread state immediately, don't wait for the next update
+
+    function updateStatusDots(){
+      switcherEl.querySelectorAll('.convo-btn').forEach(btn=>{
+        const other = btn.dataset.other;
+        btn.querySelector('.convo-dot').innerHTML = other ? statusDotHtml(other) : '';
+      });
+      updateDmHeader();
+    }
+    function updateDmHeader(){
+      const headerEl = document.getElementById('dmHeader');
+      if(!activeOtherUser){ headerEl.style.display = 'none'; return; }
+      headerEl.style.display = 'block';
+      const statusText = isOnline(activeOtherUser)
+        ? 'Online now'
+        : (usersStatusMap[activeOtherUser] ? 'Last seen ' + timeAgo(usersStatusMap[activeOtherUser].lastSeen) : '');
+      headerEl.innerHTML = `${statusDotHtml(activeOtherUser)}<b>${activeLabel}</b> <span style="color:var(--fog-dim);">${statusText}</span>`;
+    }
+    // Live status for everyone shown in the switcher, kept updated while this tab is open.
+    messagesUsersUnsub = usersCol().onSnapshot(snap => {
+      const map = {};
+      snap.docs.forEach(d => { const data = d.data(); map[data.u] = {online: data.online, lastSeen: data.lastSeen}; });
+      usersStatusMap = map;
+      updateStatusDots();
+    }, err => console.error('Status listener error.', err));
 
     function switchConvo(channel, label, otherUser){
       activeChannel = channel;
@@ -1085,6 +1127,7 @@
       switcherEl.querySelectorAll('.convo-btn').forEach(b=>{
         b.classList.toggle('active', b.dataset.channel === channel);
       });
+      updateDmHeader();
       subscribeToChannel(channel);
     }
     switcherEl.querySelectorAll('.convo-btn').forEach(btn=>{
